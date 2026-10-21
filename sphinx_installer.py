@@ -2,7 +2,7 @@
 """Сфинксляндия Installer: находит установленные лаунчеры (официальный, TLauncher, Prism, PolyMC,
 MultiMC, Modrinth App, CurseForge, ATLauncher, GDLauncher), даёт выбрать сборку, ставит туда
 Simple Voice Chat и добавляет сервер."""
-import json, os, re, shutil, sqlite3, struct, tempfile, threading, urllib.error, urllib.parse, urllib.request, webbrowser
+import json, os, re, shutil, sqlite3, struct, subprocess, tempfile, threading, urllib.error, urllib.parse, urllib.request, webbrowser, zipfile
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
@@ -94,6 +94,9 @@ def add_server(game_dir, name, ip):
 APPDATA = os.environ.get("APPDATA") or os.path.expanduser("~")
 HOME = os.path.expanduser("~")
 LOADERS = ("neoforge", "forge", "fabric", "quilt")
+LN = {"fabric": "Fabric", "forge": "Forge", "neoforge": "NeoForge", "quilt": "Quilt"}
+MC_GROUP = "Minecraft Launcher / TLauncher / SKLauncher"
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def loader_from_text(s):
     s = (s or "").lower()
@@ -104,11 +107,13 @@ def loader_from_text(s):
 
 def mc_version(vid):
     v = (vid or "").lower()
-    m = re.search(r"neoforge[-_ ]?(\d+)\.(\d+)", v)
+    m = re.search(r"neoforge[-_ ]?(\d+(?:\.\d+)*)", v)
     if m:
-        a, b = m.groups()
-        return "1.%s" % a if b == "0" else "1.%s.%s" % (a, b)
-    m = re.search(r"(?<![\d.])(1\.\d+(?:\.\d+)?)", v)
+        n = m.group(1).split(".")
+        if int(n[0]) >= 25:  # 26.2.0.57 -> 26.2 ; 26.1.2.78 -> 26.1.2
+            return n[0] + "." + n[1] + ("" if len(n) < 3 or n[2] == "0" else "." + n[2])
+        return "1.%s" % n[0] if len(n) < 2 or n[1] == "0" else "1.%s.%s" % (n[0], n[1])
+    m = re.search(r"(?<![\d.])((?:1\.\d+|\d{2})\.\d+(?:\.\d+)?|1\.\d+)", v)
     return m.group(1) if m else None
 
 def read_json(p):
@@ -128,10 +133,20 @@ def sub_dirs(p):
     except Exception:
         return []
 
+def official_installed():
+    for p in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if p and os.path.isdir(os.path.join(p, "Minecraft Launcher")):
+            return True
+    lp = os.environ.get("LOCALAPPDATA")
+    try:
+        return bool(lp) and any(x.startswith("Microsoft.4297127D64EC6") for x in os.listdir(os.path.join(lp, "Packages")))
+    except Exception:
+        return False
+
 def scan_dotminecraft(label):
     """Официальный лаунчер / TLauncher / SKLauncher: общая папка .minecraft."""
     if not os.path.isdir(MC_DIR):
-        return None
+        return [] if official_installed() else None
     out, seen = [], set()
     for fn in ("launcher_profiles.json", "tlauncher_profiles.json"):
         data = read_json(os.path.join(MC_DIR, fn))
@@ -265,7 +280,7 @@ def scan_folder(path):
 def find_launchers():
     """-> {название лаунчера: [сборки]} только для найденных."""
     cands = [
-        ("Minecraft Launcher / TLauncher / SKLauncher", lambda: scan_dotminecraft(".minecraft")),
+        (MC_GROUP, lambda: scan_dotminecraft(".minecraft")),
         ("Prism Launcher", lambda: scan_prism(os.path.join(APPDATA, "PrismLauncher"), "Prism Launcher")),
         ("PolyMC", lambda: scan_prism(os.path.join(APPDATA, "PolyMC"), "PolyMC")),
         ("MultiMC", lambda: scan_prism(os.path.join(APPDATA, "MultiMC"), "MultiMC")),
@@ -329,7 +344,7 @@ def create_new_build(vid):
     gd = os.path.join(MC_DIR, "sphinxlandia")
     os.makedirs(gd, exist_ok=True)
     pj = os.path.join(MC_DIR, "launcher_profiles.json")
-    data = read_json(pj) or {"profiles": {}}
+    data = read_json(pj) or {"profiles": {}, "version": 3}
     if os.path.exists(pj):
         shutil.copy2(pj, pj + ".bak")
     data.setdefault("profiles", {})["sphinxlandia"] = {
@@ -337,6 +352,175 @@ def create_new_build(vid):
     with open(pj, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return gd
+
+# ---------- создание новой сборки (Fabric / Forge / NeoForge) ----------
+def jget(url):
+    with http_get(url) as r:
+        return json.load(r)
+
+def forge_version(mc):
+    p = jget("https://files.minecraftforge.net/net.minecraftforge.files/promotions_slim.json").get("promos", {})
+    v = p.get(mc + "-recommended") or p.get(mc + "-latest")
+    if not v:
+        raise RuntimeError(T("err_nover", "Forge", mc))
+    return v
+
+def neoforge_version(mc):
+    p = mc.split(".")
+    try:
+        if int(p[0]) >= 25:   # 26.2 -> "26.2.0." , 26.1.2 -> "26.1.2."
+            pref = ".".join(p + ["0"] * (3 - len(p))) + "."
+        else:                 # 1.21.11 -> "21.11."
+            pref = "%s.%s." % (p[1], p[2] if len(p) > 2 else "0")
+    except Exception:
+        raise RuntimeError(T("err_nover", "NeoForge", mc))
+    vs = jget("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge").get("versions", [])
+    stable = [v for v in vs if v.startswith(pref) and "-" not in v]
+    pool = stable or [v for v in vs if v.startswith(pref)]
+    if not pool:
+        raise RuntimeError(T("err_nover", "NeoForge", mc))
+    return max(pool, key=lambda v: tuple(int(x) for x in re.findall(r"\d+", v)))
+
+def latest_mc():
+    """Самая новая версия игры (из манифеста Mojang)."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json", headers=UA), timeout=6) as r:
+            return json.load(r)["latest"]["release"]
+    except Exception:
+        return "26.2"
+
+def fabric_version(mc):
+    vs = jget("https://meta.fabricmc.net/v2/versions/loader/" + mc)
+    for e in vs:
+        if e["loader"].get("stable"):
+            return e["loader"]["version"]
+    if vs:
+        return vs[0]["loader"]["version"]
+    raise RuntimeError(T("err_nover", "Fabric", mc))
+
+def java_major(path):
+    try:
+        p = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=20,
+                           creationflags=NOWIN, errors="ignore")
+        m = re.search(r'version "(\d+)(?:\.(\d+))?', (p.stderr or "") + (p.stdout or ""))
+        if m:
+            return int(m.group(2)) if m.group(1) == "1" and m.group(2) else int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+def need_java(mc):
+    try:
+        return 25 if int(mc.split(".")[0]) >= 25 else 21
+    except Exception:
+        return 21
+
+def find_java(log, need=21):
+    log(T("log_java"))
+    cands = []
+    jh = os.environ.get("JAVA_HOME")
+    if jh:
+        cands.append(os.path.join(jh, "bin", "java.exe"))
+    w = shutil.which("java")
+    if w:
+        cands.append(w)
+    for base, _, files in os.walk(os.path.join(MC_DIR, "runtime")):
+        if "java.exe" in files:
+            cands.append(os.path.join(base, "java.exe"))
+    for c in cands:
+        if os.path.isfile(c) and java_major(c) >= need:
+            return c
+    log(T("log_java_dl"))
+    tmp = tempfile.mkdtemp()
+    z = os.path.join(tmp, "jre.zip")
+    with http_get("https://api.adoptium.net/v3/binary/latest/%d/ga/windows/x64/jre/hotspot/normal/eclipse" % need) as r, open(z, "wb") as o:
+        shutil.copyfileobj(r, o)
+    with zipfile.ZipFile(z) as zf:
+        zf.extractall(tmp)
+    for base, _, files in os.walk(tmp):
+        if "java.exe" in files:
+            return os.path.join(base, "java.exe")
+    raise RuntimeError("Java not found")
+
+def ensure_profiles_file():
+    os.makedirs(MC_DIR, exist_ok=True)
+    pj = os.path.join(MC_DIR, "launcher_profiles.json")
+    if not os.path.exists(pj):
+        with open(pj, "w", encoding="utf-8") as f:
+            json.dump({"profiles": {}, "version": 3}, f)
+
+def run_installer(url, loader, expected_id, mc, log):
+    java = find_java(log, need_java(mc))
+    ensure_profiles_file()
+    tmp = tempfile.mkdtemp()
+    jar = os.path.join(tmp, "installer.jar")
+    log(T("log_dl", LN[loader]))
+    with http_get(url) as r, open(jar, "wb") as o:
+        shutil.copyfileobj(r, o)
+    vdir = os.path.join(MC_DIR, "versions")
+    before = set(sub_dirs(vdir))
+    p = subprocess.run([java, "-jar", jar, "--installClient", MC_DIR], capture_output=True, text=True,
+                       timeout=1500, creationflags=NOWIN, cwd=tmp, errors="ignore")
+    if p.returncode != 0:
+        raise RuntimeError(T("err_loader", LN[loader]) + "\n\n" + ((p.stdout or "") + (p.stderr or ""))[-300:])
+    new = [v for v in sub_dirs(vdir) if v not in before and loader_from_text(v) == loader]
+    if new:
+        return new[0]
+    if os.path.isdir(os.path.join(vdir, expected_id)):
+        return expected_id
+    raise RuntimeError(T("err_loader", LN[loader]))
+
+def install_loader_dotmc(loader, mc, log):
+    """Ставит загрузчик в .minecraft, возвращает id версии."""
+    log(T("log_loader", LN[loader]))
+    if loader == "fabric":
+        lv = fabric_version(mc)
+        prof = jget("https://meta.fabricmc.net/v2/versions/loader/%s/%s/profile/json" % (mc, lv))
+        vid = prof["id"]
+        d = os.path.join(MC_DIR, "versions", vid)
+        os.makedirs(d, exist_ok=True)
+        ensure_profiles_file()
+        with open(os.path.join(d, vid + ".json"), "w", encoding="utf-8") as f:
+            json.dump(prof, f)
+    elif loader == "forge":
+        v = forge_version(mc)
+        url = "https://maven.minecraftforge.net/net/minecraftforge/forge/%s-%s/forge-%s-%s-installer.jar" % (mc, v, mc, v)
+        vid = run_installer(url, loader, "%s-forge-%s" % (mc, v), mc, log)
+    else:
+        v = neoforge_version(mc)
+        url = "https://maven.neoforged.net/releases/net/neoforged/neoforge/%s/neoforge-%s-installer.jar" % (v, v)
+        vid = run_installer(url, loader, "neoforge-%s" % v, mc, log)
+    log(T("log_loader_ok", LN[loader]))
+    return vid
+
+def create_prism_instance(root, loader, mc, log):
+    log(T("log_prism"))
+    uid = {"forge": "net.minecraftforge", "neoforge": "net.neoforged", "fabric": "net.fabricmc.fabric-loader"}[loader]
+    lv = {"forge": forge_version, "neoforge": neoforge_version, "fabric": fabric_version}[loader](mc)
+    base = os.path.join(root, "instances", SERVER_NAME)
+    n = 2
+    while os.path.exists(base):
+        base = os.path.join(root, "instances", "%s %d" % (SERVER_NAME, n))
+        n += 1
+    os.makedirs(os.path.join(base, "minecraft", "mods"))
+    with open(os.path.join(base, "mmc-pack.json"), "w", encoding="utf-8") as f:
+        json.dump({"formatVersion": 1, "components": [
+            {"uid": "net.minecraft", "version": mc, "important": True},
+            {"uid": uid, "version": lv}]}, f, indent=2)
+    with open(os.path.join(base, "instance.cfg"), "w", encoding="utf-8") as f:
+        f.write("InstanceType=OneSix\nname=%s\n" % os.path.basename(base))
+    log(T("log_loader_ok", LN[loader]))
+    return os.path.join(base, "minecraft")
+
+def create_build(kind, root, loader, mc, log):
+    """Создаёт новую сборку. kind: 'dot' (.minecraft) или 'prism'. -> папка игры."""
+    if kind == "prism":
+        return create_prism_instance(root, loader, mc, log)
+    vid = install_loader_dotmc(loader, mc, log)
+    g = create_new_build(vid)
+    log(T("log_newbuild", g))
+    return g
 
 # ---------- ЯЗЫКИ ----------
 # Чтобы добавить язык: скопируй любой блок в STR, переведи, и добавь строчку в LANGS.
@@ -466,6 +650,14 @@ STR = {
 },
 }
 
+EXTRA = {'ru': {'new_build': '➕  Создать новую сборку', 'b_none_t': 'В этом лаунчере пока нет сборок с модами 😕\nНичего страшного — я могу создать её сам! Нажми «Создать новую сборку».', 'b_none_nc': 'В этом лаунчере нет сборок с модами 😕\nСоздай сборку с Forge или Fabric прямо в лаунчере и нажми «Проверить снова». Или вернись и выбери другой лаунчер.', 'nl_h': 'Выбери «движок» для модов', 'nl_t': 'Это программа, благодаря которой в игре работают моды. Не знаешь, что выбрать — бери Fabric.', 'd_fabric': '⭐  Рекомендуем, если не знаешь, что выбрать\n\n👍  Плюсы\n•  Самый лёгкий и быстрый\n•  Игра запускается быстрее\n•  Новые версии появляются первыми\n•  Не нужно ставить Java\n\n👎  Минусы\n•  Некоторых больших старых модов нет', 'd_forge': '👍  Плюсы\n•  Больше всего модов в мире\n•  Подходит для больших сборок (магия, техника)\n•  Много гайдов и подсказок\n\n👎  Минусы\n•  Игра грузится дольше\n•  Установка дольше (Java я скачаю сам, если её нет)', 'd_neoforge': '👍  Плюсы\n•  Современная ветка Forge\n•  Активно развивается\n•  Хорош для новых версий игры\n\n👎  Минусы\n•  Модов пока меньше, чем у Forge и Fabric\n•  Здесь доступен только для версии 1.21.1', 'nv_h': 'Какую версию игры ставим?', 'nv_t': 'Если не уверен — оставь первую.', 'v_1211': 'новая, свежие моды', 'v_1201': 'самая популярная для модов', 'sum_new': 'Новая сборка «{0}» — {1} {2}', 'ing_t': 'Это может занять несколько минут. Не закрывай окно.', 'ld_official': 'Просто и привычно, от создателей игры. Нужен аккаунт Microsoft с купленной игрой.', 'ld_prism': '⭐ Лучший для модов: легко делает сборки с Forge и Fabric. Бесплатный, без рекламы.', 'ld_modrinth': 'Красивый и удобный: моды и сборки ставятся в один клик.', 'ld_curse': 'Огромный каталог готовых сборок. Немного тяжелее остальных.', 'ld_tl': 'Сторонний лаунчер (не от Mojang). Ставь, только если знаешь, зачем он тебе.', 'log_java': 'Ищу Java...', 'log_java_dl': 'Скачиваю Java (один раз, примерно 50 МБ)...', 'log_loader': 'Устанавливаю {0} (это может занять пару минут)...', 'log_loader_ok': '{0} установлен ✔', 'log_prism': 'Создаю сборку в лаунчере... Если он открыт — перезапусти его.', 'err_loader': 'Не получилось установить {0}. Попробуй другой движок или версию.', 'err_nover': 'Для {0} нет версии под Minecraft {1}. Выбери другую версию.'}, 'en': {'new_build': '➕  Create a new build', 'b_none_t': 'This launcher has no modded builds yet 😕\nNo problem — I can create one for you! Press "Create a new build".', 'b_none_nc': 'This launcher has no modded builds 😕\nCreate a Forge or Fabric build in the launcher itself and press "Check again". Or go back and pick another launcher.', 'nl_h': 'Pick a mod "engine"', 'nl_t': 'This is the program that makes mods work in the game. Not sure? Take Fabric.', 'd_fabric': "⭐  Recommended if you're not sure\n\n👍  Pros\n•  Lightest and fastest\n•  The game starts faster\n•  New versions arrive first\n•  No need to install Java\n\n👎  Cons\n•  Some big old mods are missing", 'd_forge': "👍  Pros\n•  The most mods in the world\n•  Great for big modpacks (magic, tech)\n•  Lots of guides and tips\n\n👎  Cons\n•  The game loads slower\n•  Takes longer to install (I'll download Java if you don't have it)", 'd_neoforge': '👍  Pros\n•  The modern branch of Forge\n•  Actively developed\n•  Good for new game versions\n\n👎  Cons\n•  Fewer mods than Forge and Fabric\n•  Available here only for version 1.21.1', 'nv_h': 'Which game version?', 'nv_t': "If you're not sure, keep the first one.", 'v_1211': 'new, fresh mods', 'v_1201': 'the most popular for mods', 'sum_new': 'New build "{0}" — {1} {2}', 'ing_t': "This can take a few minutes. Don't close the window.", 'ld_official': "Simple and familiar, from the game's makers. Needs a Microsoft account that owns the game.", 'ld_prism': '⭐ Best for mods: easily makes Forge and Fabric builds. Free, no ads.', 'ld_modrinth': 'Pretty and handy: mods and modpacks install in one click.', 'ld_curse': 'A huge catalog of ready modpacks. A bit heavier than the others.', 'ld_tl': 'Third-party launcher (not from Mojang). Install it only if you know why you need it.', 'log_java': 'Looking for Java...', 'log_java_dl': 'Downloading Java (one time, about 50 MB)...', 'log_loader': 'Installing {0} (this can take a couple of minutes)...', 'log_loader_ok': '{0} installed ✔', 'log_prism': "Creating the build in the launcher... If it's open, restart it.", 'err_loader': "Couldn't install {0}. Try another engine or version.", 'err_nover': '{0} has no version for Minecraft {1}. Pick another version.'}, 'uk': {'new_build': '➕  Створити нову збірку', 'b_none_t': 'У цьому лаунчері поки немає збірок з модами 😕\nНічого страшного — я можу створити її сам! Натисни «Створити нову збірку».', 'b_none_nc': 'У цьому лаунчері немає збірок з модами 😕\nСтвори збірку з Forge або Fabric прямо в лаунчері і натисни «Перевірити знову». Або повернись і обери інший лаунчер.', 'nl_h': 'Обери «рушій» для модів', 'nl_t': 'Це програма, завдяки якій у грі працюють моди. Не знаєш, що обрати — бери Fabric.', 'd_fabric': "⭐  Рекомендуємо, якщо не знаєш, що обрати\n\n👍  Плюси\n•  Найлегший і найшвидший\n•  Гра запускається швидше\n•  Нові версії з'являються першими\n•  Не треба ставити Java\n\n👎  Мінуси\n•  Деяких великих старих модів немає", 'd_forge': '👍  Плюси\n•  Найбільше модів у світі\n•  Підходить для великих збірок (магія, техніка)\n•  Багато гайдів і підказок\n\n👎  Мінуси\n•  Гра вантажиться довше\n•  Установка довша (Java я завантажу сам, якщо її немає)', 'd_neoforge': '👍  Плюси\n•  Сучасна гілка Forge\n•  Активно розвивається\n•  Добрий для нових версій гри\n\n👎  Мінуси\n•  Модів поки менше, ніж у Forge і Fabric\n•  Тут доступний лише для версії 1.21.1', 'nv_h': 'Яку версію гри ставимо?', 'nv_t': 'Якщо не впевнений — залиш першу.', 'v_1211': 'нова, свіжі моди', 'v_1201': 'найпопулярніша для модів', 'sum_new': 'Нова збірка «{0}» — {1} {2}', 'ing_t': 'Це може тривати кілька хвилин. Не закривай вікно.', 'ld_official': 'Просто і звично, від творців гри. Потрібен акаунт Microsoft з купленою грою.', 'ld_prism': '⭐ Найкращий для модів: легко робить збірки з Forge і Fabric. Безкоштовний, без реклами.', 'ld_modrinth': 'Гарний і зручний: моди та збірки ставляться в один клік.', 'ld_curse': 'Величезний каталог готових збірок. Трохи важчий за інші.', 'ld_tl': 'Сторонній лаунчер (не від Mojang). Став, лише якщо знаєш, навіщо він тобі.', 'log_java': 'Шукаю Java...', 'log_java_dl': 'Завантажую Java (один раз, приблизно 50 МБ)...', 'log_loader': 'Встановлюю {0} (це може тривати пару хвилин)...', 'log_loader_ok': '{0} встановлено ✔', 'log_prism': 'Створюю збірку в лаунчері... Якщо він відкритий — перезапусти його.', 'err_loader': 'Не вийшло встановити {0}. Спробуй інший рушій або версію.', 'err_nover': 'Для {0} немає версії під Minecraft {1}. Обери іншу версію.'}}
+for _l, _d in EXTRA.items():
+    STR[_l].update(_d)
+
+EXTRA2 = {'ru': {'v_latest': 'самая новая версия игры', 'v_12111': 'проверенная, много модов', 'nv_t': 'Первая — самая свежая. Вторая — для тех, кому важны проверенные моды.', 'd_forge': '👍  Плюсы\n•  Больше всего модов в мире\n•  Подходит для больших сборок (магия, техника)\n•  Много гайдов и подсказок\n\n👎  Минусы\n•  Игра грузится дольше\n•  Установка дольше (Java я скачаю сам, если её нет)\n•  Для самых новых версий игры может ещё не быть', 'd_neoforge': '👍  Плюсы\n•  Современная ветка Forge\n•  Активно развивается\n•  Хорош для новых версий игры\n\n👎  Минусы\n•  Модов пока меньше, чем у Forge и Fabric\n•  Для самых новых версий бывает ещё в тестовой стадии'}, 'en': {'v_latest': 'the newest game version', 'v_12111': 'proven, lots of mods', 'nv_t': 'The first one is the freshest. The second is for those who want proven mods.', 'd_forge': "👍  Pros\n•  The most mods in the world\n•  Great for big modpacks (magic, tech)\n•  Lots of guides and tips\n\n👎  Cons\n•  The game loads slower\n•  Takes longer to install (I'll download Java if you don't have it)\n•  May not exist yet for the very newest game versions", 'd_neoforge': '👍  Pros\n•  The modern branch of Forge\n•  Actively developed\n•  Good for new game versions\n\n👎  Cons\n•  Fewer mods than Forge and Fabric\n•  Sometimes still in testing for the very newest versions'}, 'uk': {'v_latest': 'найновіша версія гри', 'v_12111': 'перевірена, багато модів', 'nv_t': 'Перша — найсвіжіша. Друга — для тих, кому важливі перевірені моди.', 'd_forge': '👍  Плюси\n•  Найбільше модів у світі\n•  Підходить для великих збірок (магія, техніка)\n•  Багато гайдів і підказок\n\n👎  Мінуси\n•  Гра вантажиться довше\n•  Установка довша (Java я завантажу сам, якщо її немає)\n•  Для найновіших версій гри може ще не бути', 'd_neoforge': '👍  Плюси\n•  Сучасна гілка Forge\n•  Активно розвивається\n•  Добрий для нових версій гри\n\n👎  Мінуси\n•  Модів поки менше, ніж у Forge і Fabric\n•  Для найновіших версій буває ще в тестовій стадії'}}
+for _l, _d in EXTRA2.items():
+    STR[_l].update(_d)
+
 def T(key, *a):
     s = STR.get(CUR["lang"], {}).get(key) or STR["en"].get(key) or key
     return s.format(*a) if a else s
@@ -488,12 +680,12 @@ FONT = "Segoe UI"
 
 class Btn(tk.Label):
     """Большая плоская кнопка."""
-    def __init__(self, parent, text, cmd, primary=True, size=13):
+    def __init__(self, parent, text, cmd, primary=True, size=13, width=None):
         self.cmd, self.on = cmd, True
         self.c1, self.c2 = (ACC, ACC2) if primary else (CARD2, "#3a3a44")
         self.fg = "#111111" if primary else FG
         super().__init__(parent, text=text, bg=self.c1, fg=self.fg, cursor="hand2",
-                         font=(FONT, size, "bold"), padx=22, pady=10)
+                         font=(FONT, size, "bold"), padx=22, pady=10, **({"width": width} if width else {}))
         self.bind("<Enter>", lambda e: self.on and self.config(bg=self.c2))
         self.bind("<Leave>", lambda e: self.on and self.config(bg=self.c1))
         self.bind("<Button-1>", lambda e: self.on and self.cmd())
@@ -624,7 +816,7 @@ class App:
         for w in self.footer.winfo_children():
             w.destroy()
         self.draw_langs()
-        self.draw_steps({"welcome": 0, "launcher": 1, "build": 2, "confirm": 3, "install": 3, "error": 3, "done": 4}[page])
+        self.draw_steps({"welcome": 0, "launcher": 1, "build": 2, "newl": 2, "newv": 2, "confirm": 3, "install": 3, "error": 3, "done": 4}[page])
         getattr(self, "page_" + page)()
 
     def foot(self, back=None, extra=(), nxt=None, nxt_text=None):
@@ -680,14 +872,17 @@ class App:
         self.status = None
         if not self.keys:
             self.P(T("l_none_t"), FG, 13)
-            grid = tk.Frame(self.body, bg=BG)
-            grid.pack(anchor="w", pady=6)
-            links = [(T("dl_official"), None), ("Prism Launcher", "https://prismlauncher.org/download/"),
-                     ("Modrinth App", "https://modrinth.com/app"), ("CurseForge", "https://www.curseforge.com/download/app"),
-                     ("TLauncher", "https://tlauncher.org/")]
-            for i, (name, url) in enumerate(links):
-                Btn(grid, "⬇  " + name, lambda u=url: self.download(u), primary=False, size=11).grid(
-                    row=i // 2, column=i % 2, padx=6, pady=6, sticky="w")
+            links = [("dl_official", None, "ld_official"), ("Prism Launcher", "https://prismlauncher.org/download/", "ld_prism"),
+                     ("Modrinth App", "https://modrinth.com/app", "ld_modrinth"),
+                     ("CurseForge", "https://www.curseforge.com/download/app", "ld_curse"),
+                     ("TLauncher", "https://tlauncher.org/", "ld_tl")]
+            for lab, url, dk in links:
+                r = tk.Frame(self.body, bg=BG)
+                r.pack(fill="x", pady=4)
+                Btn(r, "⬇  " + (T(lab) if lab == "dl_official" else lab), lambda u=url: self.download(u),
+                    primary=False, size=11, width=24).pack(side="left")
+                tk.Label(r, text=T(dk), bg=BG, fg=MUTED, font=(FONT, 11), anchor="w", justify="left",
+                         wraplength=430).pack(side="left", padx=12, fill="x", expand=True)
             self.status = self.P("", ACC)
             self.foot(back=lambda: self.show("welcome"),
                       extra=[(T("recheck"), self.recheck), (T("manual"), self.pick_manual)])
@@ -723,17 +918,78 @@ class App:
             return self.show("launcher")
         self.cur = self.found[self.keys[self.sel_l]]
         self.H(T("b_h"))
+        can = self.creator() is not None
         if not self.cur:
-            self.P(T("b_none_t"), FG, 13)
-            self.foot(back=lambda: self.show("launcher"), extra=[(T("recheck"), self.recheck)])
+            self.P(T("b_none_t") if can else T("b_none_nc"), FG, 13)
+            ex = [(T("recheck"), self.recheck)]
+            if can:
+                self.foot(back=lambda: self.show("launcher"), extra=ex, nxt=self.new_flow, nxt_text=T("new_build"))
+            else:
+                self.foot(back=lambda: self.show("launcher"), extra=ex)
             return
         self.P(T("b_t"))
         labels = ["%s   [%s %s]" % (b["name"], (b["loader"] or "?").capitalize(), b["mc"] or "?") for b in self.cur]
-        nb = self.foot(back=lambda: self.show("launcher"), extra=[(T("recheck"), self.recheck)], nxt=self.build_next)
+        ex = ([(T("new_build"), self.new_flow)] if can else []) + [(T("recheck"), self.recheck)]
+        nb = self.foot(back=lambda: self.show("launcher"), extra=ex, nxt=self.build_next)
         def pick(i):
             self.sel_i = i
             nb.enable(i is not None)
         self.listbox(labels, pick)
+
+    def creator(self):
+        k = self.keys[self.sel_l]
+        if k == MC_GROUP:
+            return ("dot", None)
+        roots = {"Prism Launcher": "PrismLauncher", "PolyMC": "PolyMC", "MultiMC": "MultiMC"}
+        if k in roots:
+            return ("prism", os.path.join(APPDATA, roots[k]))
+        return None
+
+    def new_flow(self):
+        self.new_loader = "fabric"
+        self.show("newl")
+
+    def page_newl(self):
+        self.H(T("nl_h"))
+        self.P(T("nl_t"))
+        row = tk.Frame(self.body, bg=BG)
+        row.pack(fill="both", expand=True, pady=4)
+        items = ["fabric", "forge", "neoforge"]
+        lb = tk.Listbox(row, font=(FONT, 16, "bold"), bg=CARD, fg=FG, selectbackground=ACC, selectforeground="#111",
+                        highlightthickness=0, bd=0, activestyle="none", exportselection=False, width=12, height=3)
+        for it in items:
+            lb.insert("end", "   " + LN[it] + ("  ⭐" if it == "fabric" else ""))
+        lb.pack(side="left", fill="y", ipady=8)
+        card = tk.Label(row, bg=CARD, fg=FG, font=(FONT, 12), anchor="nw", justify="left",
+                        wraplength=440, padx=18, pady=14)
+        card.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        def pick(e=None):
+            s = lb.curselection()
+            i = s[0] if s else items.index(self.new_loader)
+            self.new_loader = items[i]
+            card.config(text=T("d_" + items[i]))
+        lb.bind("<<ListboxSelect>>", pick)
+        lb.selection_set(items.index(self.new_loader))
+        pick()
+        self.foot(back=lambda: self.show("build"), nxt=lambda: self.show("newv"))
+
+    def page_newv(self):
+        self.H(T("nv_h"))
+        self.P(T("nv_t"))
+        lat = latest_mc()
+        vs = [(lat, "v_latest")] + ([("1.21.11", "v_12111")] if lat != "1.21.11" else [])
+        self.new_mc = vs[0][0]
+        nb = self.foot(back=lambda: self.show("newl"), nxt=self.make_new)
+        def pick(i):
+            if i is not None:
+                self.new_mc = vs[i][0]
+        self.listbox(["%s   —   %s" % (v, T(k)) for v, k in vs], pick)
+
+    def make_new(self):
+        kind, root = self.creator()
+        self.inst = {"create": True, "kind": kind, "root": root, "loader": self.new_loader, "mc": self.new_mc,
+                     "name": SERVER_NAME, "game_dir": None, "vid": None, "dotmc": False}
+        self.show("confirm")
 
     def build_next(self):
         b = dict(self.cur[self.sel_i])
@@ -753,7 +1009,8 @@ class App:
         card = tk.Frame(self.body, bg=CARD)
         card.pack(fill="x", pady=8)
         rows = [(T("sum_l"), self.lname(self.keys[self.sel_l])),
-                (T("sum_b"), "%s  [%s %s]" % (b["name"], b["loader"].capitalize(), b["mc"])),
+                (T("sum_b"), T("sum_new", SERVER_NAME, LN[b["loader"]], b["mc"]) if b.get("create")
+                 else "%s  [%s %s]" % (b["name"], b["loader"].capitalize(), b["mc"])),
                 (T("sum_s"), "%s — %s" % (SERVER_NAME, SERVER_IP))]
         for k, v in rows:
             r = tk.Frame(card, bg=CARD)
@@ -761,11 +1018,13 @@ class App:
             tk.Label(r, text=k, bg=CARD, fg=MUTED, font=(FONT, 11), width=10, anchor="w").pack(side="left")
             tk.Label(r, text=v, bg=CARD, fg=FG, font=(FONT, 13, "bold"), anchor="w",
                      justify="left", wraplength=560).pack(side="left", fill="x")
-        self.foot(back=lambda: self.show("build"), nxt=self.start_install, nxt_text=T("install"))
+        self.foot(back=lambda: self.show("newv" if b.get("create") else "build"), nxt=self.start_install, nxt_text=T("install"))
 
     def start_install(self):
         b = self.inst
         self.target = b["game_dir"]
+        if b.get("create"):
+            return self.show("install")
         mods = os.path.join(self.target, "mods")
         if os.path.isdir(mods) and any(f.endswith(".jar") for f in os.listdir(mods)):
             if b["dotmc"] and b["vid"]:
@@ -791,9 +1050,12 @@ class App:
         b, target = self.inst, self.target
         def work():
             try:
-                g = target or create_new_build(b["vid"])
-                if not target:
-                    self.log(T("log_newbuild", g))
+                if b.get("create"):
+                    g = create_build(b["kind"], b["root"], b["loader"], b["mc"], self.log)
+                else:
+                    g = target or create_new_build(b["vid"])
+                    if not target:
+                        self.log(T("log_newbuild", g))
                 install_voice_chat(g, b["mc"], b["loader"], self.log)
                 self.log(T("log_srv_ok") if add_server(g, SERVER_NAME, SERVER_IP) else T("log_srv_have"))
                 self.root.after(600, lambda: self.finish(None))
