@@ -5,7 +5,7 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>disable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>SphinxInstaller</AssemblyName>
     <RootNamespace>SphinxInstaller</RootNamespace>
     <ApplicationIcon>icon.ico</ApplicationIcon>
