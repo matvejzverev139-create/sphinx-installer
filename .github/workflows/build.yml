@@ -7,12 +7,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-dotnet@v4
         with:
-          python-version: "3.12"
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --noconsole --icon icon.ico --name SphinxInstaller sphinx_installer.py
+          dotnet-version: "8.0.x"
+      - run: >
+          dotnet publish SphinxInstaller.csproj -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true -o out
       - uses: actions/upload-artifact@v4
         with:
           name: SphinxInstaller
-          path: dist/SphinxInstaller.exe
+          path: out/SphinxInstaller.exe
