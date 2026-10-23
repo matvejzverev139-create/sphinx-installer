@@ -1,6 +1,9 @@
 name: build-exe
 on:
   push:
+    paths-ignore:
+      - "autototem-mod/**"
+      - ".github/workflows/build-mod.yml"
   workflow_dispatch:
 jobs:
   build:
