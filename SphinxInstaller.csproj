@@ -10,7 +10,13 @@
     <RootNamespace>SphinxInstaller</RootNamespace>
     <ApplicationIcon>icon.ico</ApplicationIcon>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <Version>2.0.0</Version>
+    <Version>2.0.1</Version>
+    <Company>Sphinxlandia</Company>
+    <Product>Sphinxlandia Installer</Product>
+    <Description>Sphinxlandia Installer</Description>
+    <Copyright>Sphinxlandia</Copyright>
+    <FileVersion>2.0.1.0</FileVersion>
+    <AssemblyVersion>2.0.1.0</AssemblyVersion>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
