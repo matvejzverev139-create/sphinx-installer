@@ -1,0 +1,19 @@
+{
+	"schemaVersion": 1,
+	"id": "autototem",
+	"version": "${version}",
+	"name": "Auto Totem",
+	"description": "Automatically moves a Totem of Undying into your offhand when it becomes empty (e.g. after a totem pops).",
+	"authors": ["Qwermix_lol"],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.qwermix.autototem.AutoTotemClient"]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}
