@@ -26,3 +26,7 @@ dotnet publish SphinxInstaller.csproj -c Release -r win-x64 --self-contained tru
 - `Dialogs.cs` — тёмные диалоги
 
 Настройки сервера — в начале `Installer.cs`.
+
+## Лицензия
+
+MIT — см. файл [LICENSE](LICENSE). Автор: Qwermix_lol.
